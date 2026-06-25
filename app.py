@@ -498,7 +498,7 @@ if anom_samples and normal_samples:
     fig5, ax5 = plt.subplots(figsize=(6, 5))
     bp = ax5.boxplot(
         [mean_normal_expr, mean_anom_expr],
-        labels=['Normal Samples', 'Anomalous Samples'],
+        tick_labels=['Normal Samples', 'Anomalous Samples'],
         patch_artist=True,
         notch=False,
         boxprops=dict(facecolor='steelblue', alpha=0.7),
