@@ -200,12 +200,29 @@ def run_pipeline(data, _sample_ids):
     if data_clean.empty:
         return None, "No valid numeric data found after cleaning."
 
+    # Deduplicate gene index BEFORE transpose (duplicate gene names become
+    # duplicate columns after .T, which causes DuplicateError in sklearn)
+    if data_clean.index.duplicated().any():
+        idx = pd.Series(data_clean.index.astype(str))
+        for dup in idx[idx.duplicated()].unique():
+            dup_locs = idx[idx == dup].index.tolist()
+            idx[dup_locs] = [f"{dup}_g{i+1}" for i in range(len(dup_locs))]
+        data_clean.index = idx.values
+
     # Transpose: rows = samples, columns = genes
     data_T = data_clean.T
 
     # Log2 transform (handles zeros safely)
     data_log = np.log2(data_T + 1)
     data_log.columns = [str(c).strip() for c in data_log.columns]
+
+    # Final safety check — deduplicate columns after transpose
+    if data_log.columns.duplicated().any():
+        cols = pd.Series(data_log.columns)
+        for dup in cols[cols.duplicated()].unique():
+            dup_locs = cols[cols == dup].index.tolist()
+            cols[dup_locs] = [f"{dup}_g{i+1}" for i in range(len(dup_locs))]
+        data_log.columns = cols.values
 
     # Standardise
     scaler = StandardScaler()
