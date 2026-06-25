@@ -64,28 +64,102 @@ if uploaded_file is None:
     st.stop()
 
 # ─────────────────────────────────────────
+# HELPER: Make column names unique
+# ─────────────────────────────────────────
+def deduplicate_columns(df):
+    """Rename duplicate column names by appending a suffix."""
+    cols = pd.Series(df.columns.astype(str))
+    for dup in cols[cols.duplicated()].unique():
+        dup_mask = cols == dup
+        dup_indices = cols[dup_mask].index.tolist()
+        cols[dup_indices] = [f"{dup}_s{i+1}" for i in range(len(dup_indices))]
+    df.columns = cols
+    return df
+
+# ─────────────────────────────────────────
+# HELPER: Try multiple header rows for CSV/TXT
+# ─────────────────────────────────────────
+def try_read_csv(content, sep):
+    """
+    Try reading with header=0 first.
+    If columns are duplicated or all-numeric, try header=1 then header=2.
+    Always returns a clean DataFrame with unique string column names.
+    """
+    for header_row in [0, 1, 2]:
+        try:
+            df = pd.read_csv(StringIO(content), sep=sep, index_col=0,
+                             header=header_row, low_memory=False)
+            if df.empty:
+                continue
+            # Check if columns look like data (all numeric) — a sign headers are missing
+            cols_numeric = pd.to_numeric(pd.Series(df.columns), errors='coerce').notna().all()
+            if cols_numeric and header_row < 2:
+                continue  # try next header row
+            # Deduplicate if needed
+            if df.columns.duplicated().any():
+                df = deduplicate_columns(df)
+            return df, None
+        except Exception as e:
+            continue
+    return None, "Could not parse the file with any header configuration."
+
+# ─────────────────────────────────────────
 # DATA LOADING
 # ─────────────────────────────────────────
 @st.cache_data
 def load_data(uploaded_file):
     filename = uploaded_file.name.lower()
     try:
+        # ── GZ files ──────────────────────────────────────────────────────
         if filename.endswith('.gz'):
             with gzip.open(uploaded_file, 'rt', encoding='utf-8') as f:
                 lines = [line for line in f if not line.startswith(('!', '#'))]
             clean = '\n'.join(lines)
             sep = '\t' if '\t' in clean[:500] else ','
-            return pd.read_csv(StringIO(clean), sep=sep, index_col=0, low_memory=False)
+            df, err = try_read_csv(clean, sep)
+            if err:
+                st.error(f"❌ {err}")
+                st.stop()
+            return df
 
+        # ── Excel files ───────────────────────────────────────────────────
         elif filename.endswith(('.xlsx', '.xls')):
-            return pd.read_excel(uploaded_file, index_col=0)
+            df = pd.read_excel(uploaded_file, index_col=0)
+            if df.columns.duplicated().any():
+                df = deduplicate_columns(df)
+            return df
 
+        # ── CSV / TXT / TSV ───────────────────────────────────────────────
         else:
-            content = uploaded_file.read().decode('utf-8')
+            raw_bytes = uploaded_file.read()
+
+            # Try UTF-8 first, fall back to latin-1
+            try:
+                content = raw_bytes.decode('utf-8')
+            except UnicodeDecodeError:
+                content = raw_bytes.decode('latin-1')
+
+            # Strip comment/metadata lines starting with ! or #
             lines = [l for l in content.splitlines() if not l.startswith(('!', '#'))]
             clean = '\n'.join(lines)
-            sep = '\t' if '\t' in clean[:500] else ','
-            return pd.read_csv(StringIO(clean), sep=sep, index_col=0, low_memory=False)
+
+            if not clean.strip():
+                st.error("❌ File appears to be empty after removing comment lines.")
+                st.stop()
+
+            # Auto-detect separator
+            first_line = lines[0] if lines else ''
+            tab_count   = first_line.count('\t')
+            comma_count = first_line.count(',')
+            semi_count  = first_line.count(';')
+            sep = '\t' if tab_count >= comma_count and tab_count >= semi_count else \
+                  ',' if comma_count >= semi_count else ';'
+
+            df, err = try_read_csv(clean, sep)
+            if err:
+                st.error(f"❌ Failed to load file: {err}")
+                st.stop()
+            return df
 
     except Exception as e:
         st.error(f"❌ Failed to load file: {e}")
@@ -93,12 +167,26 @@ def load_data(uploaded_file):
 
 data = load_data(uploaded_file)
 
+# ─────────────────────────────────────────
+# POST-LOAD VALIDATION
+# ─────────────────────────────────────────
 if data is None or data.empty:
     st.error("Uploaded file is empty or could not be parsed.")
     st.stop()
+
+# Drop fully empty rows/columns silently
+data = data.dropna(how='all').dropna(axis=1, how='all')
+
 if data.shape[0] < 3 or data.shape[1] < 3:
-    st.error("Dataset must have at least 3 genes (rows) and 3 samples (columns).")
+    st.error(
+        f"Dataset must have at least 3 genes (rows) and 3 samples (columns). "
+        f"Got {data.shape[0]} rows and {data.shape[1]} columns after cleaning. "
+        "Check that your file has genes as rows and samples as columns."
+    )
     st.stop()
+
+# Ensure all column names are strings
+data.columns = data.columns.astype(str)
 
 st.success(f"✅ Loaded **{data.shape[1]} samples** and **{data.shape[0]} genes** successfully.")
 
@@ -126,13 +214,13 @@ def run_pipeline(data, _sample_ids):
     # --- Step 2: PCA (dimensionality reduction) ---
     n_components_pca = min(10, data_scaled.shape[1], data_scaled.shape[0] - 1)
     pca = PCA(n_components=n_components_pca)
-    pca_result = pca.fit_transform(data_scaled)         # shape: (n_samples, n_components_pca)
-    pca_2d = pca_result[:, :2]                          # first 2 PCs for plotting
+    pca_result = pca.fit_transform(data_scaled)
+    pca_2d = pca_result[:, :2]
 
-    # --- Step 3: FA applied ON TOP of PCA output (not raw data) ---
+    # --- Step 3: FA applied ON TOP of PCA output ---
     n_fa = min(2, pca_result.shape[1], pca_result.shape[0] - 1)
     fa = FactorAnalysis(n_components=n_fa, random_state=42)
-    fa_result = fa.fit_transform(pca_result)            # FA on PCA output
+    fa_result = fa.fit_transform(pca_result)
 
     # --- Step 4: LOF on FA result ---
     n_neighbors = min(10, len(fa_result) - 1)
@@ -145,7 +233,7 @@ def run_pipeline(data, _sample_ids):
 
     # Adaptive threshold: 95th percentile
     threshold = np.percentile(lof_scores, 95)
-    labels = np.where(lof_scores > threshold, -1, 1)    # -1 = anomaly, 1 = normal
+    labels = np.where(lof_scores > threshold, -1, 1)
 
     # --- Step 5: Metrics ---
     lof_sep_ratio = None
@@ -156,8 +244,8 @@ def run_pipeline(data, _sample_ids):
     normal_mask  = labels == 1
 
     if anomaly_mask.sum() > 0 and normal_mask.sum() > 0:
-        mean_anom  = np.mean(lof_scores[anomaly_mask])
-        mean_norm  = np.mean(lof_scores[normal_mask])
+        mean_anom = np.mean(lof_scores[anomaly_mask])
+        mean_norm = np.mean(lof_scores[normal_mask])
         lof_sep_ratio = mean_anom / mean_norm if mean_norm > 0 else None
 
         if len(set(labels)) > 1:
@@ -169,13 +257,13 @@ def run_pipeline(data, _sample_ids):
 
     # --- Step 6: Build result DataFrame ---
     plot_df = pd.DataFrame({
-        'Sample':          _sample_ids,
-        'PC1':             pca_2d[:, 0],
-        'PC2':             pca_2d[:, 1],
-        'FA1':             fa_result[:, 0],
-        'FA2':             fa_result[:, 1] if fa_result.shape[1] > 1 else np.zeros(len(fa_result)),
-        'LOF_Score':       lof_scores,
-        'Anomaly':         labels
+        'Sample':    _sample_ids,
+        'PC1':       pca_2d[:, 0],
+        'PC2':       pca_2d[:, 1],
+        'FA1':       fa_result[:, 0],
+        'FA2':       fa_result[:, 1] if fa_result.shape[1] > 1 else np.zeros(len(fa_result)),
+        'LOF_Score': lof_scores,
+        'Anomaly':   labels
     })
 
     # --- Step 7: Heatmap data ---
@@ -269,7 +357,6 @@ plt.tight_layout()
 st.pyplot(fig1)
 plt.close(fig1)
 
-# Scree plot
 st.markdown("""
 **Variance Explained per Component:**  
 The bar chart below shows how much information each PC captures. 
@@ -292,7 +379,7 @@ plt.close(fig_scree)
 st.markdown("---")
 
 # ═══════════════════════════════════════════════════════
-# STAGE 2 — FA (on PCA output)
+# STAGE 2 — FA
 # ═══════════════════════════════════════════════════════
 st.markdown("## 🟢 Stage 2 — Factor Analysis: Uncovering Hidden Biological Signals")
 st.markdown("""
@@ -331,7 +418,7 @@ plt.close(fig2)
 st.markdown("---")
 
 # ═══════════════════════════════════════════════════════
-# STAGE 3 — LOF with Adaptive Threshold
+# STAGE 3 — LOF
 # ═══════════════════════════════════════════════════════
 st.markdown("## 🔴 Stage 3 — LOF Anomaly Scoring with Adaptive Threshold")
 st.markdown("""
@@ -340,16 +427,15 @@ Local Outlier Factor (LOF) assigns every sample a **"weirdness score"** based on
 compared to its nearest neighbours in the Factor Analysis space.
 
 - A score **close to 1.0** = the sample fits in well with its neighbours → **normal**
-- A score **much higher than 1.0** = the sample is far more isolated than its neighbours → **anomalous**
+- A score **much higher than 1.0** = the sample is far more isolated → **anomalous**
 
 **What is the Adaptive Threshold?**  
 Rather than using a fixed cutoff, the threshold is set at the **95th percentile** of all LOF scores.  
-This means the top 5% most unusual samples are flagged — adapting automatically to your dataset size and distribution.
+This means the top 5% most unusual samples are flagged — adapting automatically to your dataset.
 
 > 💡 Samples to the **right of the red dashed line** are flagged as anomalies.
 """)
 
-# LOF histogram
 fig3, ax3 = plt.subplots(figsize=(8, 4))
 n_bins = min(30, max(10, len(lof_scores) // 2))
 ax3.hist(lof_scores[labels == 1],  bins=n_bins, color='steelblue',
@@ -367,7 +453,6 @@ plt.tight_layout()
 st.pyplot(fig3)
 plt.close(fig3)
 
-# LOF per-sample scatter
 st.markdown("""
 **Per-Sample LOF Score:**  
 The plot below shows each sample's individual LOF score so you can identify exactly 
@@ -395,7 +480,7 @@ plt.close(fig4)
 st.markdown("---")
 
 # ═══════════════════════════════════════════════════════
-# STAGE 4 — QUANTITATIVE METRICS
+# STAGE 4 — METRICS
 # ═══════════════════════════════════════════════════════
 st.markdown("## 📐 Stage 4 — Quantitative Performance Metrics")
 st.markdown("""
@@ -447,15 +532,10 @@ with col3:
         st.info("Not computable")
     st.caption("**Higher is better.** Ratio of average anomaly LOF score to average normal LOF score.")
 
-# Metric bar chart
-st.markdown("""
-**Visual Comparison of Metrics:**  
-The bar chart below compares the three metrics side by side on a normalised scale for easy reading.
-""")
 metrics_available = {}
-if sil_score  is not None: metrics_available['Silhouette\n(higher=better)']      = max(0, sil_score)
-if db_index   is not None: metrics_available['Davies-Bouldin\n(lower=better)']   = db_index
-if lof_sep_ratio is not None: metrics_available['LOF Sep. Ratio\n(higher=better)'] = lof_sep_ratio
+if sil_score     is not None: metrics_available['Silhouette\n(higher=better)']       = max(0, sil_score)
+if db_index      is not None: metrics_available['Davies-Bouldin\n(lower=better)']    = db_index
+if lof_sep_ratio is not None: metrics_available['LOF Sep. Ratio\n(higher=better)']   = lof_sep_ratio
 
 if metrics_available:
     fig_m, ax_m = plt.subplots(figsize=(7, 4))
@@ -475,20 +555,20 @@ if metrics_available:
 st.markdown("---")
 
 # ═══════════════════════════════════════════════════════
-# STAGE 5 — BOX PLOT COMPARISON
+# STAGE 5 — BOX PLOT
 # ═══════════════════════════════════════════════════════
 st.markdown("## 📦 Stage 5 — Gene Expression: Anomalous vs Normal")
 st.markdown("""
 **What does this box plot show?**  
 Each box represents the distribution of **average gene expression** across all genes for that group.
 
-- The **line in the middle** of the box = median expression  
-- The **box edges** = 25th and 75th percentile (where most samples sit)  
+- The **line in the middle** = median expression  
+- The **box edges** = 25th and 75th percentile  
 - The **whiskers** = overall spread  
 - **Dots** outside whiskers = extreme samples  
 
-> 💡 If the two boxes are clearly separated, anomalous samples genuinely express genes differently from normal ones — 
-confirming biological relevance, not just statistical noise.
+> 💡 If the two boxes are clearly separated, anomalous samples genuinely express genes differently from 
+normal ones — confirming biological relevance, not just statistical noise.
 """)
 
 if anom_samples and normal_samples:
@@ -519,7 +599,7 @@ else:
 st.markdown("---")
 
 # ═══════════════════════════════════════════════════════
-# STAGE 6 — HEATMAP WITH BOUNDARY LINE
+# STAGE 6 — HEATMAP
 # ═══════════════════════════════════════════════════════
 st.markdown("## 🧬 Stage 6 — Gene Activity Heatmap")
 st.markdown("""
@@ -546,7 +626,6 @@ if not heatmap_data.empty:
         cbar_kws={'label': 'Log₂ Gene Expression'},
         ax=ax6
     )
-    # Boundary line between anomalous and normal
     if n_anomalous > 0 and n_anomalous < heatmap_data.shape[0]:
         ax6.axvline(x=n_anomalous, color='white', linewidth=2.5,
                     linestyle='--', label='Anomalous | Normal boundary')
@@ -571,12 +650,10 @@ if not heatmap_data.empty:
 st.markdown("---")
 
 # ═══════════════════════════════════════════════════════
-# STAGE 7 — SUMMARY METRICS TABLE
+# STAGE 7 — SUMMARY TABLE
 # ═══════════════════════════════════════════════════════
 st.markdown("## 📋 Stage 7 — Pipeline Summary Table")
-st.markdown("""
-A full summary of all key numbers from the analysis in one place.
-""")
+st.markdown("A full summary of all key numbers from the analysis in one place.")
 
 total_variance = sum(pca.explained_variance_ratio_[:2]) * 100
 
@@ -658,7 +735,6 @@ if n_anomalous > 0:
 
     st.dataframe(anomaly_report, use_container_width=True, hide_index=True)
 
-    # Full report CSV
     full_report = plot_df.copy()
     full_report['Status'] = full_report['Anomaly'].map({-1: 'Anomalous', 1: 'Normal'})
     full_report['LOF_Score'] = full_report['LOF_Score'].round(4)
